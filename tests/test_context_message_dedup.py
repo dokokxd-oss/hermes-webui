@@ -146,6 +146,158 @@ def test_merge_display_messages_dedup_via_prefix():
     assert merged[3]["content"] == "answer"
 
 
+def test_merge_display_drops_old_assistant_text_grafted_onto_current_tool_call():
+    """The three observed multi-call replay shapes keep their real tool rows."""
+    from api.streaming import _merge_display_messages_after_agent_result
+
+    for tool_call_count in (5, 3, 4):
+        tool_calls = [
+            {
+                "id": f"call-current-{index}",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+            }
+            for index in range(tool_call_count)
+        ]
+        active_turn = {"token": "turn-current"}
+        previous_display = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+            {
+                "role": "user",
+                "content": "current question",
+                "_active_turn_token": "turn-current",
+            },
+        ]
+        previous_context = list(previous_display)
+        result_messages = previous_context + [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": tool_calls,
+                "reasoning_content": "current reasoning",
+            },
+            {
+                "role": "assistant",
+                "content": "old answer",
+                "tool_calls": tool_calls,
+                "reasoning_content": "current reasoning",
+            },
+            *[
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": f"result-{index}",
+                }
+                for index, call in enumerate(tool_calls)
+            ],
+        ]
+
+        merged = _merge_display_messages_after_agent_result(
+            previous_display,
+            previous_context,
+            result_messages,
+            "current question",
+            verification_nudge_provenance={"active_turn_identity": active_turn},
+        )
+
+        old_answers = [
+            message
+            for message in merged
+            if message.get("role") == "assistant" and message.get("content") == "old answer"
+        ]
+        assert len(old_answers) == 1
+        assert not old_answers[0].get("tool_calls")
+        assert not old_answers[0].get("reasoning_content")
+        tool_assistants = [
+            message
+            for message in merged
+            if message.get("role") == "assistant" and not message.get("content")
+        ]
+        assert len(tool_assistants) == 1
+        assert [call["id"] for call in tool_assistants[0]["tool_calls"]] == [
+            call["id"] for call in tool_calls
+        ]
+        assert [
+            message["tool_call_id"]
+            for message in merged
+            if message.get("role") == "tool"
+        ] == [call["id"] for call in tool_calls]
+
+
+def test_merge_display_preserves_history_text_when_tool_calls_only_partly_overlap():
+    """A later assistant carrying any new call id is not the observed replay shape."""
+    from api.streaming import _merge_display_messages_after_agent_result
+
+    first_call = {
+        "id": "call-existing",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+    }
+    new_call = {
+        "id": "call-new",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"y"}'},
+    }
+    previous_display = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "current question"},
+    ]
+    previous_context = list(previous_display)
+    result_messages = previous_context + [
+        {"role": "assistant", "content": "", "tool_calls": [first_call]},
+        {
+            "role": "assistant",
+            "content": "old answer",
+            "tool_calls": [first_call, new_call],
+        },
+    ]
+
+    merged = _merge_display_messages_after_agent_result(
+        previous_display,
+        previous_context,
+        result_messages,
+        "current question",
+    )
+
+    assert any(
+        message.get("role") == "assistant"
+        and message.get("content") == "old answer"
+        and [call["id"] for call in message.get("tool_calls", [])]
+        == ["call-existing", "call-new"]
+        for message in merged
+    )
+
+
+def test_merge_display_preserves_same_answer_for_a_new_real_turn():
+    """Identical visible text is valid when it answers a different user turn."""
+    from api.streaming import _merge_display_messages_after_agent_result
+
+    previous_display = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "same answer"},
+        {"role": "user", "content": "second question"},
+    ]
+    previous_context = list(previous_display)
+    result_messages = previous_context + [
+        {"role": "assistant", "content": "same answer"},
+    ]
+
+    merged = _merge_display_messages_after_agent_result(
+        previous_display,
+        previous_context,
+        result_messages,
+        "second question",
+    )
+
+    assert [
+        message.get("content")
+        for message in merged
+        if message.get("role") == "assistant"
+    ] == ["same answer", "same answer"]
+
+
 def test_merge_display_messages_preserves_current_user_turn():
     """The current user turn replacement logic should still work."""
     from api.streaming import _merge_display_messages_after_agent_result

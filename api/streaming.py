@@ -7319,6 +7319,14 @@ def _merge_display_messages_after_agent_result(
 
     merged = previous_display[:]
     seen = {_message_identity(m) for m in merged}
+    historical_assistant_texts = {
+        " ".join(_message_text(m.get('content', '')).split())
+        for m in merged
+        if isinstance(m, dict)
+        and m.get('role') == 'assistant'
+        and _message_text(m.get('content', '')).strip()
+    }
+    empty_tool_assistant_signatures = set()
     current_user_key = _message_identity({'role': 'user', 'content': msg_text})
     current_user_in_candidates = any(
         _message_identity(m) == current_user_key or _looks_like_current_user_turn(m, msg_text)
@@ -7367,6 +7375,37 @@ def _merge_display_messages_after_agent_result(
             or _is_compressed_context_tool_result_summary_message(msg)
         ):
             continue
+        msg_tool_calls = msg.get('tool_calls') or [] if isinstance(msg, dict) else []
+        msg_tool_signature = (
+            json.dumps(msg_tool_calls, sort_keys=True, ensure_ascii=False)
+            if msg_tool_calls
+            else ''
+        )
+        msg_reasoning_signature = (
+            str(msg.get('reasoning_content') or msg.get('reasoning') or '')
+            if isinstance(msg, dict)
+            else ''
+        )
+        msg_assistant_text = (
+            " ".join(_message_text(msg.get('content', '')).split())
+            if isinstance(msg, dict) and msg.get('role') == 'assistant'
+            else ''
+        )
+        msg_tool_assistant_signature = (
+            msg_tool_signature,
+            msg_reasoning_signature,
+        )
+        if (
+            msg_tool_signature
+            and msg_assistant_text in historical_assistant_texts
+            and msg_tool_assistant_signature in empty_tool_assistant_signatures
+        ):
+            # Settlement can graft an already-visible old answer onto the exact
+            # current empty tool-call assistant. Require full call payload and
+            # reasoning equality; partial overlap may carry a legitimate new call.
+            continue
+        if msg_tool_signature and not msg_assistant_text:
+            empty_tool_assistant_signatures.add(msg_tool_assistant_signature)
         key = _message_identity(msg)
         is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
         if (
