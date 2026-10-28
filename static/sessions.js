@@ -35,8 +35,9 @@ let _pendingCarryForwardSnapshot = null;
 // ── Composer draft persistence ────────────────────────────────────────────────
 
 // Debounced save — prevents hammering the server on every keystroke.
-let _draftSaveTimer = null;
+const _draftSaveTimers = new Map();
 const _DRAFT_SAVE_DELAY_MS = 400;
+const _composerDraftWriteStates = new Map();
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
@@ -217,23 +218,65 @@ async function _restoreRememberedNewChatDraftSession() {
   }
 }
 
+function _drainComposerDraftWrite(sid, state) {
+  const current = state.inFlight;
+  api('/api/session/draft', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, text: current.text, files: current.files }),
+  }).then(() => {
+    _rememberComposerDraftPayloadState(sid, current.text, current.files);
+  }).catch(() => {}).finally(() => {
+    current.waiters.forEach(resolve => resolve());
+    if (state.queued.length) {
+      state.inFlight = state.queued.shift();
+      _drainComposerDraftWrite(sid, state);
+    } else {
+      _composerDraftWriteStates.delete(sid);
+    }
+  });
+}
+
+function _enqueueComposerDraftWrite(sid, text, files) {
+  return new Promise((resolve) => {
+    let state = _composerDraftWriteStates.get(sid);
+    const write = { text, files, clear: !text && !files.length, waiters: [resolve] };
+    if (!state) {
+      state = { inFlight: write, queued: [] };
+      _composerDraftWriteStates.set(sid, state);
+      _drainComposerDraftWrite(sid, state);
+      return;
+    }
+    const last = state.queued[state.queued.length - 1];
+    if (last && last.clear === write.clear) {
+      write.waiters.unshift(...last.waiters);
+      state.queued[state.queued.length - 1] = write;
+    } else {
+      state.queued.push(write);
+    }
+  });
+}
+
+function _cancelComposerDraftTimer(sid) {
+  const timer = _draftSaveTimers.get(sid);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  _draftSaveTimers.delete(sid);
+}
+
 function _saveComposerDraft(sid, text, files) {
   if (!sid) return;
-  clearTimeout(_draftSaveTimer);
+  _cancelComposerDraftTimer(sid);
   const normalizedText = String(text || '');
   const normalizedFiles = _composerDraftFilesForPersist(files);
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
     _composerDraftKnownPayloadSessions.add(sid);
   }
-  _draftSaveTimer = setTimeout(() => {
-    api('/api/session/draft', {
-      method: 'POST',
-      body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles }),
-    }).then(() => {
-      _rememberComposerDraftPayloadState(sid, normalizedText, normalizedFiles);
-    }).catch(() => {});
+  const timer = setTimeout(() => {
+    _draftSaveTimers.delete(sid);
+    _enqueueComposerDraftWrite(sid, normalizedText, normalizedFiles);
   }, _DRAFT_SAVE_DELAY_MS);
+  _draftSaveTimers.set(sid, timer);
 }
 
 function _composerDraftHasPayload(text, files) {
@@ -262,7 +305,7 @@ function _rememberComposerDraftPayloadState(sid, text, files) {
 // Immediate save used before session switches.
 function _saveComposerDraftNow(sid, text, files) {
   if (!sid) return Promise.resolve();
-  clearTimeout(_draftSaveTimer);
+  _cancelComposerDraftTimer(sid);
   const normalizedText = String(text || '');
   const normalizedFiles = _composerDraftFilesForPersist(files);
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
@@ -277,12 +320,7 @@ function _saveComposerDraftNow(sid, text, files) {
       && !_composerDraftKnownPayloadSessions.has(sid)) {
     return Promise.resolve();
   }
-  return api('/api/session/draft', {
-    method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles }),
-  }).then(() => {
-    _rememberComposerDraftPayloadState(sid, normalizedText, normalizedFiles);
-  }).catch(() => {});
+  return _enqueueComposerDraftWrite(sid, normalizedText, normalizedFiles);
 }
 
 // Restore composer draft from server onto #msg textarea.
@@ -333,16 +371,11 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
 // Clear the saved draft for a session (called when message is sent).
 function _clearComposerDraft(sid, text, files) {
   if (!sid) return;
-  clearTimeout(_draftSaveTimer);
+  _cancelComposerDraftTimer(sid);
   _clearRememberedNewChatDraftSession(sid);
   if (arguments.length >= 2) _suppressComposerDraftRestoreAfterSubmit(sid, text, files);
   else _suppressComposerDraftRestoreAfterSubmit(sid);
-  return api('/api/session/draft', {
-    method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: '' }),
-  }).then(() => {
-    _rememberComposerDraftPayloadState(sid, '', []);
-  }).catch(() => {});
+  return _enqueueComposerDraftWrite(sid, '', []);
 }
 
 const SESSION_VIEWED_COUNTS_KEY = 'hermes-session-viewed-counts';
