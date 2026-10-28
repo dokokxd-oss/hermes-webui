@@ -39,6 +39,9 @@ let _draftSaveTimer = null;
 let _draftSaveTimerSid = null;
 let _draftSaveTimerPayload = null;
 let _draftSaveTimerRev = 0;
+const _draftSaveTimersBySid = new Map();
+const _draftSaveTimerPayloadBySid = new Map();
+const _draftSaveTimerRevBySid = new Map();
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
@@ -63,6 +66,14 @@ const _composerDraftLatestIntentSequenceBySid = new Map();
 const _composerDraftPostPromisesBySid = new Map();
 let _composerDraftIntentSequence = 0;
 const _COMPOSER_DRAFT_RESTORE_SUPPRESS_MS = 30000;
+
+function _forgetComposerDraftTimer(sid, cancel=true) {
+  const timer = _draftSaveTimersBySid.get(sid);
+  if (cancel && timer !== undefined) clearTimeout(timer);
+  _draftSaveTimersBySid.delete(sid);
+  _draftSaveTimerPayloadBySid.delete(sid);
+  _draftSaveTimerRevBySid.delete(sid);
+}
 
 function _setComposerDraftLocalIntent(sid, text, files) {
   const intent = Object.freeze({
@@ -257,7 +268,7 @@ async function _restoreRememberedNewChatDraftSession() {
 
 function _saveComposerDraft(sid, text, files) {
   if (!sid) return;
-  clearTimeout(_draftSaveTimer);
+  _forgetComposerDraftTimer(sid);
   const normalizedText = String(text || '');
   const liveFiles = Array.isArray(files) ? files.filter(Boolean).slice() : [];
   const normalizedFiles = _composerDraftFilesForPersist(files);
@@ -273,6 +284,8 @@ function _saveComposerDraft(sid, text, files) {
   _draftSaveTimerSid = sid;
   _draftSaveTimerPayload = _composerDraftPayloadSignature(normalizedText, normalizedFiles);
   _draftSaveTimerRev = _composerDraftRevision(sid);
+  _draftSaveTimerPayloadBySid.set(sid, _draftSaveTimerPayload);
+  _draftSaveTimerRevBySid.set(sid, _draftSaveTimerRev);
   // #7855 (round 9, MUST-FIX 1): snapshot the restored goal-continuation
   // binding WHEN THE AUTOSAVE IS SCHEDULED. Two clients sharing a session can
   // otherwise drop an unchanged continuation's token: another client's write
@@ -285,6 +298,7 @@ function _saveComposerDraft(sid, text, files) {
     ? _peekRestoredGoalContinuationDraft()
     : null;
   _draftSaveTimer = setTimeout(() => {
+    _forgetComposerDraftTimer(sid, false);
     let _autosaveContId = '';
     if (_restoredCont && _restoredCont.id
         && String(_restoredCont.text || '').trim() === String(normalizedText || '').trim()) {
@@ -294,6 +308,7 @@ function _saveComposerDraft(sid, text, files) {
       _handleComposerDraftPostFailure(error, sid, normalizedText, liveFiles, intent);
     });
   }, _DRAFT_SAVE_DELAY_MS);
+  _draftSaveTimersBySid.set(sid, _draftSaveTimer);
 }
 
 function _safeDraftSessionId(sid) {
@@ -357,6 +372,50 @@ function _handleComposerDraftPostFailure(error, sid, text, files, intent=null) {
   }
 }
 
+function _enqueueComposerDraftWrite(targetSid, dispatch, barrier=false) {
+  let state = _composerDraftPostPromisesBySid.get(targetSid);
+  if (!state || !Array.isArray(state.queue)) {
+    state = { active: false, queue: [] };
+    _composerDraftPostPromisesBySid.set(targetSid, state);
+  }
+  const pump = () => {
+    if (state.active || !state.queue.length) {
+      if (!state.active && !state.queue.length
+          && _composerDraftPostPromisesBySid.get(targetSid) === state) {
+        _composerDraftPostPromisesBySid.delete(targetSid);
+      }
+      return;
+    }
+    const entry = state.queue[0];
+    entry.started = true;
+    state.active = true;
+    let result;
+    try { result = entry.dispatch(); }
+    catch (error) { result = Promise.reject(error); }
+    Promise.resolve(result).then(
+      (value) => entry.waiters.forEach((waiter) => waiter.resolve(value)),
+      (error) => entry.waiters.forEach((waiter) => waiter.reject(error)),
+    ).then(() => {
+      state.queue.shift();
+      state.active = false;
+      pump();
+    });
+  };
+  return new Promise((resolve, reject) => {
+    let entry = null;
+    const tail = state.queue[state.queue.length - 1];
+    if (!barrier && tail && !tail.started && !tail.barrier) {
+      entry = tail;
+      entry.dispatch = dispatch;
+    } else {
+      entry = { dispatch, barrier: !!barrier, started: false, waiters: [] };
+      state.queue.push(entry);
+    }
+    entry.waiters.push({ resolve, reject });
+    pump();
+  });
+}
+
 function _postComposerDraftPayload(sid, draft, intent=null, goalContinuationId='') {
   const requestSid = _safeDraftSessionId(sid);
   if (!requestSid) return Promise.resolve();
@@ -378,35 +437,15 @@ function _postComposerDraftPayload(sid, draft, intent=null, goalContinuationId='
     files: normalizedFiles,
     goal_continuation_id: normalizedGoalContId,
   }));
-  const post = (targetSid, beforeDispatch) => {
-    const previous = _composerDraftPostPromisesBySid.get(targetSid);
-    let resolveWrite;
-    let rejectWrite;
-    const write = new Promise((resolve, reject) => {
-      resolveWrite = resolve;
-      rejectWrite = reject;
+  const isClearBarrier = !_composerDraftHasPayload(normalizedText, normalizedFiles)
+    && _composerDraftRestoreSuppressedUntilBySid.has(requestSid);
+  const post = (targetSid, beforeDispatch) => _enqueueComposerDraftWrite(targetSid, () => {
+    if (beforeDispatch) beforeDispatch();
+    return api('/api/session/draft', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: targetSid, ...bodyPayload }),
     });
-    const pending = write.finally(() => {
-      if (_composerDraftPostPromisesBySid.get(targetSid) === pending) {
-        _composerDraftPostPromisesBySid.delete(targetSid);
-      }
-    });
-    _composerDraftPostPromisesBySid.set(targetSid, pending);
-    const dispatch = () => {
-      try {
-        if (beforeDispatch) beforeDispatch();
-        resolveWrite(api('/api/session/draft', {
-          method: 'POST',
-          body: JSON.stringify({ session_id: targetSid, ...bodyPayload }),
-        }));
-      } catch (error) {
-        rejectWrite(error);
-      }
-    };
-    if (previous) Promise.resolve(previous).then(dispatch, dispatch);
-    else dispatch();
-    return pending;
-  };
+  }, isClearBarrier);
   const remember = (responseSid) => {
     if (responseSid !== requestSid) {
       _composerDraftKnownPayloadSessions.delete(requestSid);
@@ -449,6 +488,8 @@ function _postComposerDraftPayload(sid, draft, intent=null, goalContinuationId='
     if (intent && error && (typeof error === 'object' || typeof error === 'function')) {
       try { Object.defineProperty(error, '_composerDraftIntent', { value: intent }); } catch (_) { }
     }
+    // The queue has already advanced to the latest write. Keep failure handling
+    // at the existing call sites so each failed intent is reported exactly once.
     throw error;
   });
 }
@@ -479,7 +520,9 @@ function _rememberComposerDraftPayloadState(sid, text, files) {
 // Immediate save used before session switches.
 function _saveComposerDraftNow(sid, text, files, goalContinuationId) {
   if (!sid) return Promise.resolve();
-  clearTimeout(_draftSaveTimer);
+  if (typeof _draftSaveTimersBySid !== 'undefined') {
+    _forgetComposerDraftTimer(sid);
+  } else if (_draftSaveTimerSid === sid) clearTimeout(_draftSaveTimer);
   const normalizedText = String(text || '');
   const liveFiles = Array.isArray(files) ? files.filter(Boolean).slice() : [];
   const normalizedFiles = _composerDraftFilesForPersist(files);
@@ -601,7 +644,9 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
 function _clearComposerDraft(sid, text, files) {
   if (!sid) return;
   // The pending debounced save may belong to another session (e.g. after New Chat).
-  if (_draftSaveTimerSid === sid) clearTimeout(_draftSaveTimer);
+  if (typeof _draftSaveTimersBySid !== 'undefined') {
+    _forgetComposerDraftTimer(sid);
+  } else if (_draftSaveTimerSid === sid) clearTimeout(_draftSaveTimer);
   _clearRememberedNewChatDraftSession(sid);
   if (arguments.length >= 2) _suppressComposerDraftRestoreAfterSubmit(sid, text, files);
   else _suppressComposerDraftRestoreAfterSubmit(sid);
@@ -626,23 +671,25 @@ function _clearComposerDraft(sid, text, files) {
 // it; a later save (re-typed by the user) or a different payload is newer.
 function _clearComposerDraftIfUnchanged(sid, text, files, maxRev) {
   if (!sid) return Promise.resolve(false);
-  if (_draftSaveTimerSid === sid && _draftSaveTimerRev <= Number(maxRev)
-      && _draftSaveTimerPayload === _composerDraftPayloadSignature(text, files)) clearTimeout(_draftSaveTimer);
+  if ((_draftSaveTimerRevBySid.get(sid) || 0) <= Number(maxRev)
+      && _draftSaveTimerPayloadBySid.get(sid) === _composerDraftPayloadSignature(text, files)) {
+    _forgetComposerDraftTimer(sid);
+  }
   const ifFiles = _composerDraftFilesForPersist(files);
   const ifSig = _composerDraftPayloadSignature(String(text || ''), ifFiles);
-  // Join the per-session draft write chain so an earlier queued save cannot
-  // land after this compare-and-clear and resurrect the retired draft.
-  const previous = _composerDraftPostPromisesBySid.get(sid);
-  const dispatch = () => api('/api/session/draft', {
-    method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: '', files: [], if_text: String(text || ''), if_files: ifFiles }),
+  const dispatch = (targetSid) => api('/api/session/draft', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: targetSid, text: '', files: [], if_text: String(text || ''), if_files: ifFiles }),
+    });
+  // Join each authority's per-session queue as a non-coalescible barrier. A
+  // rotated owner may reject once with session_moved; replay the identical
+  // compare condition once on the canonical sid, preserving both queues.
+  const write = _enqueueComposerDraftWrite(sid, () => dispatch(sid), true).catch((error) => {
+    const movedSid = _parseSessionMovedDraftError(error);
+    if (!error || error.status !== 409 || !movedSid || movedSid === sid) throw error;
+    return _enqueueComposerDraftWrite(movedSid, () => dispatch(movedSid), true);
   });
-  const write = previous ? Promise.resolve(previous).then(dispatch, dispatch) : dispatch();
-  const pending = write.finally(() => {
-    if (_composerDraftPostPromisesBySid.get(sid) === pending) _composerDraftPostPromisesBySid.delete(sid);
-  });
-  _composerDraftPostPromisesBySid.set(sid, pending);
-  return pending.then((r) => {
+  return write.then((r) => {
     if (r && r.mismatch) return false;
     // A failed-save local fallback holding exactly the retired payload is now stale.
     const fallback = _composerDraftLocalFallbackBySid.get(sid);

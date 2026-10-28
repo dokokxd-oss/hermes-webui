@@ -46,8 +46,14 @@ CASES = [
     "file:///tmp/x.png?raw=1",
     "file:///home/me/my%20report.png",
     "file://localhost/C:/x.png",
+    "file://wsl.localhost/Ubuntu/home/rog/report.png",
+    "file://wsl$/Ubuntu/home/rog/report.png",
     "file://server/share/x.png",
     "file://server:abc/share/x.png",
+    "file:////server/share/x.png",
+    "file://localhost/%2Fserver/share/x.png",
+    "file:////server/share/%ZZ",
+    "file:///%2Fserver/share/%ZZ",
 ]
 
 
@@ -68,8 +74,16 @@ def _path(href):
 
 
 def test_settled_link_converter_rejects_unc_authority(results):
-    assert results["file://server/share/x.png"]["settled"] == "file://server/share/x.png"
-    assert results["file://server:abc/share/x.png"]["settled"] == "file://server:abc/share/x.png"
+    for case in (
+        "file://server/share/x.png",
+        "file://server:abc/share/x.png",
+        "file:////server/share/x.png",
+        "file://localhost/%2Fserver/share/x.png",
+        "file:////server/share/%ZZ",
+        "file:///%2Fserver/share/%ZZ",
+    ):
+        assert results[case]["settled"] == case
+        assert results[case]["streaming"] == case
 
 
 def test_streaming_link_converter_keeps_the_suffix(results):
@@ -87,6 +101,8 @@ def test_local_paths_unchanged(results):
     assert _path(results["file:///tmp/a%23b.png"]["settled"]) == "/tmp/a#b.png"
     assert _path(results["file:///home/me/my%20report.png"]["settled"]) == "/home/me/my report.png"
     assert _path(results["file://localhost/C:/x.png"]["settled"]) == "/C:/x.png"
+    assert _path(results["file://wsl.localhost/Ubuntu/home/rog/report.png"]["settled"]) == "/home/rog/report.png"
+    assert _path(results["file://wsl$/Ubuntu/home/rog/report.png"]["streaming"]) == "/home/rog/report.png"
 
 
 def test_empty_delimiters_are_kept(results):

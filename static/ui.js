@@ -3273,6 +3273,33 @@ function _mediaTokenParts(source, matchOffset, rawRef){
 }
 
 function _inlineMediaHtmlForRef(ref, sessionId, altText){
+  // Keep this helper local: renderer contract tests intentionally extract and
+  // execute _inlineMediaHtmlForRef without the rest of ui.js. WSL file URLs
+  // include a distro routing segment that is not part of the Linux path.
+  function _localPathFromFileUrl(ref){
+    const raw=String(ref||'');
+    try{
+      const u=new URL(ref);
+      const host=String(u.hostname||'').toLowerCase();
+      const suffix=(raw.match(/[?#][\s\S]*$/)||[''])[0];
+      const path=decodeURIComponent((u.pathname||'')+suffix);
+      if(host==='wsl.localhost'||host==='wsl$'){
+        const routed=path.match(/^\/[^/]+(\/[\s\S]*)$/);
+        return routed&&!/^\/\//.test(routed[1])?routed[1]:null;
+      }
+      if(host&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(host)) return null;
+      if(/^\/\//.test(path)) return null;
+      return path;
+    }catch(_){
+      // An unparseable URI with an authority may hide a non-local host.
+      if(/^file:\/\/[^/?#]+/i.test(raw)) return null;
+      const stripped=raw.replace(/^file:\/\//i,'');
+      try{
+        const path=decodeURIComponent(stripped);
+        return /^\/\//.test(path)?null:path;
+      }catch(__){return null;}
+    }
+  }
   if(ref==null) return '';
   // data:image/* → inline <img>; any other data: scheme renders as inert
   // truncated text (never routed to api/media, never embedded).
@@ -3287,27 +3314,8 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
   // so the variable name is the original `ref` (not `r`) and the file://
   // unwrap keeps the matched identifier visible.
   if(/^file:\/\//i.test(ref)){
-    try{
-      const u=new URL(ref);
-      // #8033: file:///C:/Users/me/x parses to pathname '/C:/Users/me/x' —
-      // the file-URI grammar keeps the leading separator before the drive
-      // letter. The once-decoded pathname is forwarded to the backend AS-IS
-      // (no client-side strip): the server gates the drive-letter conversion
-      // on its own OS, so on a POSIX server '/C:/...' stays absolute and can
-      // never alias a cwd-relative drive-shaped path. Non-local file
-      // authorities (UNC: file://server/share/...) are explicitly rejected
-      // here — never silently rewired to a local path.
-      if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return '';
-      ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
-    }catch(_){
-      // Fail-closed on a parse failure (AGENTS.md): the raw string may hide
-      // a non-local authority that the URL parse above never got to check.
-      // Reject anything shaped like 'file://<authority>/...' rather than
-      // silently rendering a local media element from it.
-      if(/^file:\/\/[^/?#]+/i.test(ref)) return '';
-      try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
-      catch(__){ref=ref.replace(/^file:\/\//i,'');}
-    }
+    ref=_localPathFromFileUrl(ref);
+    if(ref==null) return '';
   }
   if(/^https?:\/\//i.test(ref)){
     let src=ref;
@@ -9742,6 +9750,31 @@ function renderMd(raw){
     return String(v||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&').trim();
   }
   function _markdownHref(raw){
+    // Keep this copy inside _markdownHref: converter regression drivers execute
+    // this function without the surrounding renderMd closure.
+    function _localPathFromFileUrl(ref){
+      const raw=String(ref||'');
+      try{
+        const u=new URL(ref);
+        const host=String(u.hostname||'').toLowerCase();
+        const suffix=(raw.match(/[?#][\s\S]*$/)||[''])[0];
+        const path=decodeURIComponent((u.pathname||'')+suffix);
+        if(host==='wsl.localhost'||host==='wsl$'){
+          const routed=path.match(/^\/[^/]+(\/[\s\S]*)$/);
+          return routed&&!/^\/\//.test(routed[1])?routed[1]:null;
+        }
+        if(host&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(host)) return null;
+        if(/^\/\//.test(path)) return null;
+        return path;
+      }catch(_){
+        if(/^file:\/\/[^/?#]+/i.test(raw)) return null;
+        const stripped=raw.replace(/^file:\/\//i,'');
+        try{
+          const path=decodeURIComponent(stripped);
+          return /^\/\//.test(path)?null:path;
+        }catch(__){return null;}
+      }
+    }
     const href=String(raw||'').replace(/"/g,'%22');
     if(/^session:\/\//i.test(href)){
       const sid=href.replace(/^session:\/\//i,'').split(/[?#]/)[0];
@@ -9762,20 +9795,8 @@ function renderMd(raw){
       }
     }
     if(/^file:\/\//i.test(href)){
-      // #8033: same policy as the streaming converter (_smdLinkHref) and media refs (_inlineMediaHtmlForRef): only
-      // local authorities are served, a UNC 'file://server/share/...' link stays an inert file:// href, and the
-      // once-decoded pathname (with its '?…'/'#…' suffix) is forwarded with its leading separator.
-      try{
-        const u=new URL(href);
-        if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
-        const path=decodeURIComponent((u.pathname||'')+((href.match(/[?#][\s\S]*$/)||[''])[0]));
-        return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
-      }catch(_){
-        // Fail closed: an unparseable URI with an authority may hide a non-local host.
-        if(/^file:\/\/[^/?#]+/i.test(href)) return href;
-        try{ return 'api/media?path='+encodeURIComponent(decodeURIComponent(href.replace(/^file:\/\//i,'')))+'&inline=1'; }
-        catch(__){ return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1'; }
-      }
+      const path=_localPathFromFileUrl(href);
+      return path==null?href:'api/media?path='+encodeURIComponent(path)+'&inline=1';
     }
     return href;
   }
